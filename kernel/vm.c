@@ -15,6 +15,33 @@ extern char etext[];  // kernel.ld sets this to end of kernel code.
 
 extern char trampoline[]; // trampoline.S
 
+void _vmprint_pte_prefix(int level) {
+  if (level == 2) printf("..");
+  if (level == 1) printf(".. ..");
+  if (level == 0) printf(".. .. ..");
+}
+
+void _vmprint_with_level(pagetable_t pagetable, int level) {
+  if(level < 0) return;
+  for(int i = 0; i < 512; i++) {
+    pte_t *pte = &pagetable[i];
+    if(*pte & PTE_V) {
+      _vmprint_pte_prefix(level);
+      pagetable_t next_pagetable = (pagetable_t)PTE2PA(*pte);
+      printf("%d: pte %p pa %p\n", i, *pte, next_pagetable);
+      // only recurse into non-leaf PTEs
+      if ((*pte & (PTE_R | PTE_W | PTE_X)) == 0) {
+        _vmprint_with_level((pagetable_t)PTE2PA(*pte), level - 1);
+      }
+    }
+  }
+}
+
+void vmprint(pagetable_t pagetable) {
+  printf("page table %p\n", pagetable);
+  _vmprint_with_level(pagetable, 2);
+}
+
 /*
  * create a direct-map page table for the kernel.
  */
@@ -131,7 +158,7 @@ kvmpa(uint64 va)
   uint64 off = va % PGSIZE;
   pte_t *pte;
   uint64 pa;
-  
+
   pte = walk(kernel_pagetable, va, 0);
   if(pte == 0)
     panic("kvmpa");
@@ -233,6 +260,10 @@ uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
 
   if(newsz < oldsz)
     return oldsz;
+
+  // User memory must stay below the PLIC mapping in the kernel page table.
+  if(newsz >= PLIC)
+    return 0;
 
   oldsz = PGROUNDUP(oldsz);
   for(a = oldsz; a < newsz; a += PGSIZE){
@@ -341,7 +372,7 @@ void
 uvmclear(pagetable_t pagetable, uint64 va)
 {
   pte_t *pte;
-  
+
   pte = walk(pagetable, va, 0);
   if(pte == 0)
     panic("uvmclear");
@@ -379,23 +410,7 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 int
 copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
 {
-  uint64 n, va0, pa0;
-
-  while(len > 0){
-    va0 = PGROUNDDOWN(srcva);
-    pa0 = walkaddr(pagetable, va0);
-    if(pa0 == 0)
-      return -1;
-    n = PGSIZE - (srcva - va0);
-    if(n > len)
-      n = len;
-    memmove(dst, (void *)(pa0 + (srcva - va0)), n);
-
-    len -= n;
-    dst += n;
-    srcva = va0 + PGSIZE;
-  }
-  return 0;
+  return copyin_new(pagetable, dst, srcva, len);
 }
 
 // Copy a null-terminated string from user to kernel.
@@ -405,38 +420,72 @@ copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
 int
 copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
 {
-  uint64 n, va0, pa0;
-  int got_null = 0;
+  return copyinstr_new(pagetable, dst, srcva, max);
+}
 
-  while(got_null == 0 && max > 0){
-    va0 = PGROUNDDOWN(srcva);
-    pa0 = walkaddr(pagetable, va0);
-    if(pa0 == 0)
-      return -1;
-    n = PGSIZE - (srcva - va0);
-    if(n > max)
-      n = max;
 
-    char *p = (char *) (pa0 + (srcva - va0));
-    while(n > 0){
-      if(*p == '\0'){
-        *dst = '\0';
-        got_null = 1;
-        break;
-      } else {
-        *dst = *p;
-      }
-      --n;
-      --max;
-      p++;
-      dst++;
-    }
-
-    srcva = va0 + PGSIZE;
-  }
-  if(got_null){
+pagetable_t proc_kpagetable(uint64 kstack) {
+  pagetable_t kpt = (pagetable_t) kalloc();
+  if (kpt == 0)
     return 0;
-  } else {
-    return -1;
+  memset(kpt, 0, PGSIZE);
+
+  // uart registers
+  if (mappages(kpt, UART0, PGSIZE, UART0, PTE_R | PTE_W) != 0)
+    goto bad;
+
+  // virtio mmio disk interface
+  if (mappages(kpt, VIRTIO0, PGSIZE, VIRTIO0, PTE_R | PTE_W) != 0)
+    goto bad;
+
+  // PLIC
+  if (mappages(kpt, PLIC, 0x400000, PLIC, PTE_R | PTE_W) != 0)
+    goto bad;
+
+  // map kernel text executable and read-only
+  if (mappages(kpt, KERNBASE, (uint64)etext - KERNBASE, KERNBASE, PTE_R | PTE_X) != 0)
+    goto bad;
+
+  // map kernel data and the physical RAM we'll make use of
+  if (mappages(kpt, (uint64)etext, PHYSTOP - (uint64)etext, (uint64)etext, PTE_R | PTE_W) != 0)
+    goto bad;
+
+  // map the trampoline
+  if (mappages(kpt, TRAMPOLINE, PGSIZE, (uint64)trampoline, PTE_R | PTE_X) != 0)
+    goto bad;
+
+  // Map this process's kernel stack. procinit() already mapped it in the
+  // global kernel page table; look up its physical page and add the same
+  // mapping to this process's kernel page table.
+  pte_t *kpte = walk(kernel_pagetable, kstack, 0);
+  if(kpte == 0 || (*kpte & PTE_V) == 0)
+    goto bad;
+  if(mappages(kpt, kstack, PGSIZE, PTE2PA(*kpte), PTE_R | PTE_W) != 0)
+    goto bad;
+
+  return kpt;
+
+bad:
+  free_kpagetable(kpt);
+  return 0;
+}
+
+int
+copy_usermapping_range_to_kpagetable(pagetable_t pt, pagetable_t kpt,
+                                     uint64 start, uint64 end)
+{
+  for(uint64 va = PGROUNDUP(start); va < end; va += PGSIZE) {
+    pte_t *pte = walk(pt, va, 0);
+    if(pte == 0 || (*pte & PTE_V) == 0)
+      return -1;
+    if(mappages(kpt, va, PGSIZE, PTE2PA(*pte), PTE_FLAGS(*pte) & ~PTE_U) < 0)
+      return -1;
   }
+  return 0;
+}
+
+int
+copy_usermapping_to_kpagetable(pagetable_t pt, pagetable_t kpt, uint64 sz)
+{
+  return copy_usermapping_range_to_kpagetable(pt, kpt, 0, sz);
 }

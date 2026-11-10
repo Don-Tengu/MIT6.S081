@@ -15,6 +15,7 @@ struct proc *initproc;
 int nextpid = 1;
 struct spinlock pid_lock;
 
+extern pagetable_t kernel_pagetable;
 extern void forkret(void);
 static void wakeup1(struct proc *chan);
 static void freeproc(struct proc *p);
@@ -26,7 +27,7 @@ void
 procinit(void)
 {
   struct proc *p;
-  
+
   initlock(&pid_lock, "nextpid");
   for(p = proc; p < &proc[NPROC]; p++) {
       initlock(&p->lock, "proc");
@@ -76,7 +77,7 @@ myproc(void) {
 int
 allocpid() {
   int pid;
-  
+
   acquire(&pid_lock);
   pid = nextpid;
   nextpid = nextpid + 1;
@@ -127,8 +128,23 @@ found:
   p->context.ra = (uint64)forkret;
   p->context.sp = p->kstack + PGSIZE;
 
+  // Per-process kernel page table, including this process's kernel stack.
+  p->kpagetable = proc_kpagetable(p->kstack);
+  if(p->kpagetable == 0){
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+  if(copy_usermapping_to_kpagetable(p->pagetable, p->kpagetable, p->sz) < 0){
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+
   return p;
 }
+
+
 
 // free a proc structure and the data hanging from it,
 // including user pages.
@@ -141,7 +157,10 @@ freeproc(struct proc *p)
   p->trapframe = 0;
   if(p->pagetable)
     proc_freepagetable(p->pagetable, p->sz);
+  if(p->kpagetable)
+    free_kpagetable(p->kpagetable);
   p->pagetable = 0;
+  p->kpagetable = 0;
   p->sz = 0;
   p->pid = 0;
   p->parent = 0;
@@ -195,6 +214,26 @@ proc_freepagetable(pagetable_t pagetable, uint64 sz)
   uvmfree(pagetable, sz);
 }
 
+void
+free_kpagetable(pagetable_t pagetable)
+{
+  // There are 512 PTEs in a page table.
+  for (int i = 0; i < 512; i++) {
+    pte_t pte = pagetable[i];
+    if ((pte & PTE_V) && (pte & (PTE_R | PTE_W | PTE_X)) == 0) {
+      // Intermediate page table — recurse.
+      uint64 child = PTE2PA(pte);
+      free_kpagetable((pagetable_t)child);
+      pagetable[i] = 0;
+    } else if (pte & PTE_V) {
+      // Leaf mapping — just clear the PTE, do not free the physical page.
+      pagetable[i] = 0;
+    }
+  }
+  kfree((void *)pagetable);
+}
+
+
 // a user program that calls exec("/init")
 // od -t xC initcode
 uchar initcode[] = {
@@ -215,11 +254,13 @@ userinit(void)
 
   p = allocproc();
   initproc = p;
-  
+
   // allocate one user page and copy init's instructions
   // and data into it.
   uvminit(p->pagetable, initcode, sizeof(initcode));
   p->sz = PGSIZE;
+  if(copy_usermapping_to_kpagetable(p->pagetable, p->kpagetable, p->sz) < 0)
+    panic("userinit: user mapping");
 
   // prepare for the very first "return" from kernel to user.
   p->trapframe->epc = 0;      // user program counter
@@ -238,18 +279,53 @@ userinit(void)
 int
 growproc(int n)
 {
-  uint sz;
+  uint64 oldsz, newsz;
   struct proc *p = myproc();
 
-  sz = p->sz;
+  oldsz = p->sz;
   if(n > 0){
-    if((sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
+    // Keep the user address range below the PLIC mapping, and avoid wrapping
+    // the size calculation before uvmalloc() can reject it.
+    if(oldsz >= PLIC || (uint64)n >= PLIC - oldsz)
+      return -1;
+
+    newsz = oldsz + (uint64)n;
+    if(uvmalloc(p->pagetable, oldsz, newsz) == 0)
+      return -1;
+
+    if(copy_usermapping_range_to_kpagetable(p->pagetable, p->kpagetable,
+                                            oldsz, newsz) < 0){
+      // The range helper may have installed some aliases before running out
+      // of page-table memory. Remove them, then roll back the user allocation.
+      for(uint64 va = PGROUNDUP(oldsz); va < newsz; va += PGSIZE){
+        pte_t *pte = walk(p->kpagetable, va, 0);
+        if(pte && (*pte & PTE_V))
+          uvmunmap(p->kpagetable, va, 1, 0);
+      }
+      sfence_vma();
+      uvmdealloc(p->pagetable, newsz, oldsz);
       return -1;
     }
+
+    sfence_vma();
+    p->sz = newsz;
   } else if(n < 0){
-    sz = uvmdealloc(p->pagetable, sz, sz + n);
+    uint64 shrink = (uint64)(-(n + 1)) + 1;
+    if(shrink > oldsz)
+      return -1;
+    newsz = oldsz - shrink;
+
+    // Remove kernel aliases for the whole pages that uvmdealloc() will free.
+    uint64 first = PGROUNDUP(newsz);
+    uint64 end = PGROUNDUP(oldsz);
+    if(first < end){
+      uvmunmap(p->kpagetable, first, (end - first) / PGSIZE, 0);
+      sfence_vma();
+    }
+    p->sz = uvmdealloc(p->pagetable, oldsz, newsz);
+  } else {
+    p->sz = oldsz;
   }
-  p->sz = sz;
   return 0;
 }
 
@@ -267,13 +343,20 @@ fork(void)
     return -1;
   }
 
-  // Copy user memory from parent to child.
+  // Copy the user's pages, then map those same child pages in the child's
+  // kernel page table. The kernel table must alias the child pages rather
+  // than make a second copy of their contents.
   if(uvmcopy(p->pagetable, np->pagetable, p->sz) < 0){
     freeproc(np);
     release(&np->lock);
     return -1;
   }
   np->sz = p->sz;
+  if(copy_usermapping_to_kpagetable(np->pagetable, np->kpagetable, np->sz) < 0){
+    freeproc(np);
+    release(&np->lock);
+    return -1;
+  }
 
   np->parent = p;
 
@@ -369,7 +452,7 @@ exit(int status)
   acquire(&p->lock);
   struct proc *original_parent = p->parent;
   release(&p->lock);
-  
+
   // we need the parent's lock in order to wake it up from wait().
   // the parent-then-child rule says we have to lock it first.
   acquire(&original_parent->lock);
@@ -440,7 +523,7 @@ wait(uint64 addr)
       release(&p->lock);
       return -1;
     }
-    
+
     // Wait for a child to exit.
     sleep(p, &p->lock);  //DOC: wait-sleep
   }
@@ -458,12 +541,12 @@ scheduler(void)
 {
   struct proc *p;
   struct cpu *c = mycpu();
-  
+
   c->proc = 0;
   for(;;){
     // Avoid deadlock by ensuring that devices can interrupt.
     intr_on();
-    
+
     int found = 0;
     for(p = proc; p < &proc[NPROC]; p++) {
       acquire(&p->lock);
@@ -473,7 +556,14 @@ scheduler(void)
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+        w_satp(MAKE_SATP(p->kpagetable));
+        sfence_vma();
         swtch(&c->context, &p->context);
+
+        // swtch() returned to the scheduler stack. Restore the global table
+        // before releasing the process lock or considering another process.
+        w_satp(MAKE_SATP(kernel_pagetable));
+        sfence_vma();
 
         // Process is done running for now.
         // It should have changed its p->state before coming back.
@@ -485,6 +575,8 @@ scheduler(void)
     }
 #if !defined (LAB_FS)
     if(found == 0) {
+      w_satp(MAKE_SATP(kernel_pagetable));
+      sfence_vma();
       intr_on();
       asm volatile("wfi");
     }
@@ -559,7 +651,7 @@ void
 sleep(void *chan, struct spinlock *lk)
 {
   struct proc *p = myproc();
-  
+
   // Must acquire p->lock in order to
   // change p->state and then call sched.
   // Once we hold p->lock, we can be
