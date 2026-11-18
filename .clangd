@@ -1,0 +1,46 @@
+# Teach clangd (Zed's C language server) the xv6 include layout.
+# Without -I. it looks for a macOS Kernel framework and never sees user/user.h,
+# so fprintf, pipe, fork, and the rest show up as undeclared.
+#
+# mkfs is a host tool and needs the system headers, so it is excluded below.
+---
+If:
+  PathExclude: mkfs/.*
+# clangd's fallback command runs in the source file's directory
+# (user/, kernel/, …), so the repo root is "..", not ".".
+CompileFlags:
+  Add:
+    - -I..
+    - -I../kernel
+    - -std=gnu11
+    - -ffreestanding
+    - -fno-builtin
+    - -Wno-gnu-designator
+---
+# Opening a .h directly makes Apple clangd pass -xobjective-c++-header,
+# which rejects -std=gnu11. Force C header mode instead.
+If:
+  PathMatch: .*\.h
+CompileFlags:
+  Remove:
+    - -x
+    - -std=*
+  Add:
+    - -xc-header
+    - -std=gnu11
+---
+# user.h uses uint from kernel/types.h, which .c files include first.
+# Opening the header by itself does not, so pull that typedef in.
+If:
+  PathMatch: user/user\.h
+CompileFlags:
+  Add:
+    - -include
+    - ../kernel/types.h
+---
+If:
+  PathMatch: mkfs/.*
+CompileFlags:
+  Add:
+    - -I..
+    - -std=gnu11
