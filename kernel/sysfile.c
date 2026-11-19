@@ -66,6 +66,24 @@ sys_dup(void)
   return fd;
 }
 
+int
+lazy_allocation(uint64 p) {
+  if(p >= myproc()->sz)
+    return -1;
+  if(walkaddr(myproc()->pagetable, p) != 0)
+    return 0;
+  if(walkaddr(myproc()->pagetable, p) == 0) {
+    char *mem;
+    if((mem = kalloc()) == 0) return -1;
+    if(mappages(myproc()->pagetable, p, PGSIZE, (uint64) mem,  PTE_R|PTE_W|PTE_U) != 0) {
+      kfree((void *) mem);
+      return -1;
+    }
+  }
+  return 0;
+}
+
+
 uint64
 sys_read(void)
 {
@@ -74,6 +92,8 @@ sys_read(void)
   uint64 p;
 
   if(argfd(0, 0, &f) < 0 || argint(2, &n) < 0 || argaddr(1, &p) < 0)
+    return -1;
+  if(lazy_allocation(p) != 0)
     return -1;
   return fileread(f, p, n);
 }
@@ -87,9 +107,12 @@ sys_write(void)
 
   if(argfd(0, 0, &f) < 0 || argint(2, &n) < 0 || argaddr(1, &p) < 0)
     return -1;
-
+  if(lazy_allocation(p) != 0)
+    return -1;
   return filewrite(f, p, n);
 }
+
+
 
 uint64
 sys_close(void)
@@ -393,7 +416,7 @@ sys_chdir(void)
   char path[MAXPATH];
   struct inode *ip;
   struct proc *p = myproc();
-  
+
   begin_op();
   if(argstr(0, path, MAXPATH) < 0 || (ip = namei(path)) == 0){
     end_op();
@@ -464,6 +487,9 @@ sys_pipe(void)
 
   if(argaddr(0, &fdarray) < 0)
     return -1;
+  if(lazy_allocation(fdarray) != 0)
+    return -1;
+
   if(pipealloc(&rf, &wf) < 0)
     return -1;
   fd0 = -1;
