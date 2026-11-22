@@ -33,6 +33,11 @@ start()
   // disable paging for now.
   w_satp(0);
 
+  // Allow supervisor mode to access physical memory before enabling paging.
+  // TOR entry 0 covers addresses from zero to the maximum physical address.
+  w_pmpaddr0(0x3fffffffffffffL);
+  w_pmpcfg0(0xf); // TOR, read/write/execute
+
   // delegate all interrupts and exceptions to supervisor mode.
   w_medeleg(0xffff);
   w_mideleg(0xffff);

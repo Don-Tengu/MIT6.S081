@@ -131,7 +131,7 @@ kvmpa(uint64 va)
   uint64 off = va % PGSIZE;
   pte_t *pte;
   uint64 pa;
-  
+
   pte = walk(kernel_pagetable, va, 0);
   if(pte == 0)
     panic("kvmpa");
@@ -301,8 +301,7 @@ uvmfree(pagetable_t pagetable, uint64 sz)
 
 // Given a parent process's page table, copy
 // its memory into a child's page table.
-// Copies both the page table and the
-// physical memory.
+// Share physical pages and mark writable mappings copy-on-write.
 // returns 0 on success, -1 on failure.
 // frees any allocated pages on failure.
 int
@@ -311,27 +310,29 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
 
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
       panic("uvmcopy: pte should exist");
     if((*pte & PTE_V) == 0)
       panic("uvmcopy: page not present");
+
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
+    // Preserve genuinely read-only mappings, including existing COW flags.
+    if(flags & PTE_W)
+      flags = (flags & ~PTE_W) | PTE_C;
+    if(mappages(new, i, PGSIZE, pa, flags) != 0)
       goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
-      goto err;
-    }
+    *pte = PA2PTE(pa) | flags;
+    kaddref(pa);
   }
+  sfence_vma();
   return 0;
 
  err:
   uvmunmap(new, 0, i / PGSIZE, 1);
+  sfence_vma();
   return -1;
 }
 
@@ -341,11 +342,48 @@ void
 uvmclear(pagetable_t pagetable, uint64 va)
 {
   pte_t *pte;
-  
+
   pte = walk(pagetable, va, 0);
   if(pte == 0)
     panic("uvmclear");
   *pte &= ~PTE_U;
+}
+
+// Give a user COW mapping a private writable page.
+// Return -1 for an invalid mapping or if a new page cannot be allocated.
+int
+cowfault(pagetable_t pagetable, uint64 va)
+{
+  pte_t *pte;
+  uint64 pa;
+  uint flags;
+  char *mem;
+
+  if(va >= MAXVA)
+    return -1;
+  va = PGROUNDDOWN(va);
+  pte = walk(pagetable, va, 0);
+  if(pte == 0 || (*pte & (PTE_V | PTE_U | PTE_C)) !=
+                 (PTE_V | PTE_U | PTE_C))
+    return -1;
+
+  pa = PTE2PA(*pte);
+  flags = (PTE_FLAGS(*pte) | PTE_W) & ~PTE_C;
+  // Once all other references are gone, the original page is already private.
+  if(krefcount(pa) == 1){
+    *pte = PA2PTE(pa) | flags;
+    sfence_vma();
+    return 0;
+  }
+
+  if((mem = kalloc()) == 0)
+    return -1;
+  memmove(mem, (void*)pa, PGSIZE);
+  // Replace the existing PTE directly; mappages() rejects valid mappings.
+  *pte = PA2PTE(mem) | flags;
+  sfence_vma();
+  kfree((void*)pa);
+  return 0;
 }
 
 // Copy from kernel to user.
@@ -358,9 +396,18 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 
   while(len > 0){
     va0 = PGROUNDDOWN(dstva);
-    pa0 = walkaddr(pagetable, va0);
-    if(pa0 == 0)
+    if(va0 >= MAXVA)
       return -1;
+
+    pte_t *pte = walk(pagetable, va0, 0);
+    if(pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0)
+      return -1;
+    if((*pte & PTE_C) && cowfault(pagetable, va0) < 0)
+      return -1;
+    if((*pte & PTE_W) == 0)
+      return -1;
+    pa0 = PTE2PA(*pte);
+
     n = PGSIZE - (dstva - va0);
     if(n > len)
       n = len;

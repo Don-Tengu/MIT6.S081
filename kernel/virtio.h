@@ -2,7 +2,7 @@
 // virtio device definitions.
 // for both the mmio interface, and virtio descriptors.
 // only tested with qemu.
-// this is the "legacy" virtio interface.
+// supports both legacy and modern virtio MMIO interfaces.
 //
 // the virtio spec:
 // https://docs.oasis-open.org/virtio/virtio/v1.1/virtio-v1.1.pdf
@@ -11,11 +11,13 @@
 // virtio mmio control registers, mapped starting at 0x10001000.
 // from qemu virtio_mmio.h
 #define VIRTIO_MMIO_MAGIC_VALUE		0x000 // 0x74726976
-#define VIRTIO_MMIO_VERSION		0x004 // version; 1 is legacy
+#define VIRTIO_MMIO_VERSION		0x004 // 1 is legacy, 2 is modern
 #define VIRTIO_MMIO_DEVICE_ID		0x008 // device type; 1 is net, 2 is disk
 #define VIRTIO_MMIO_VENDOR_ID		0x00c // 0x554d4551
 #define VIRTIO_MMIO_DEVICE_FEATURES	0x010
+#define VIRTIO_MMIO_DEVICE_FEATURES_SEL	0x014
 #define VIRTIO_MMIO_DRIVER_FEATURES	0x020
+#define VIRTIO_MMIO_DRIVER_FEATURES_SEL	0x024
 #define VIRTIO_MMIO_GUEST_PAGE_SIZE	0x028 // page size for PFN, write-only
 #define VIRTIO_MMIO_QUEUE_SEL		0x030 // select queue, write-only
 #define VIRTIO_MMIO_QUEUE_NUM_MAX	0x034 // max size of current queue, read-only
@@ -27,6 +29,12 @@
 #define VIRTIO_MMIO_INTERRUPT_STATUS	0x060 // read-only
 #define VIRTIO_MMIO_INTERRUPT_ACK	0x064 // write-only
 #define VIRTIO_MMIO_STATUS		0x070 // read/write
+#define VIRTIO_MMIO_QUEUE_DESC_LOW	0x080
+#define VIRTIO_MMIO_QUEUE_DESC_HIGH	0x084
+#define VIRTIO_MMIO_QUEUE_DRIVER_LOW	0x090
+#define VIRTIO_MMIO_QUEUE_DRIVER_HIGH	0x094
+#define VIRTIO_MMIO_QUEUE_DEVICE_LOW	0x0a0
+#define VIRTIO_MMIO_QUEUE_DEVICE_HIGH	0x0a4
 
 // status register bits, from qemu virtio_config.h
 #define VIRTIO_CONFIG_S_ACKNOWLEDGE	1
@@ -42,6 +50,7 @@
 #define VIRTIO_F_ANY_LAYOUT         27
 #define VIRTIO_RING_F_INDIRECT_DESC 28
 #define VIRTIO_RING_F_EVENT_IDX     29
+#define VIRTIO_F_VERSION_1         32
 
 // this many virtio descriptors.
 // must be a power of two.
