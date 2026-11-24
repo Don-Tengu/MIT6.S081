@@ -1,0 +1,19 @@
+Missing keys in the unlocked hash table
+
+Suppose threads A and B insert different keys into the same bucket, whose
+current head is H. Both search the bucket and find that their key is absent.
+
+1. A reads table[i] as H and prepares entry EA with EA->next = H.
+2. B reads table[i] as H and prepares entry EB with EB->next = H.
+3. A publishes its entry by setting table[i] = EA.
+4. B publishes its entry by setting table[i] = EB.
+
+The bucket now contains EB -> H. EA is unreachable, so A's key is missing.
+With one thread, each insertion sees the head published by the previous
+insertion, so this interleaving cannot occur.
+
+A mutex for each bucket protects the entire search-and-update-or-insert
+operation in put(). It prevents two writers from using the same old head.
+get() uses the same bucket mutex while searching. In this benchmark, all
+put threads are joined before get threads start, so searches already run
+after insertion is complete.
